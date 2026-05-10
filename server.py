@@ -61,11 +61,12 @@ def read_email(email_id: str) -> dict:
 
 @mcp.tool()
 def search_emails(query: str, folder: str = "Inbox", limit: int = 20) -> list:
-    """Search for emails by subject, sender name, or sender email substring (case-insensitive).
+    """Search for emails by subject, sender, or recipient (case-insensitive substring match).
 
     Args:
-        query: Substring to look for in subject, sender name, or sender email.
+        query: Substring to look for in subject, sender name, sender email, recipient name, or recipient email.
         folder: Folder to search in. Use "all" to search every folder (slow on large mailboxes).
+              Use the exact French folder name (e.g. "Éléments envoyés") for Sent Items.
         limit: Max matches to return.
 
     Returns a list of matching email summaries.

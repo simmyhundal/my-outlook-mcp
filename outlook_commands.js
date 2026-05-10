@@ -132,15 +132,23 @@ function search_emails(args) {
 
     const matches = [];
     for (const folder of foldersToSearch) {
-        const msgs = folder.messages();
+        const msgs = safeGet(() => folder.messages(), []);
         for (const m of msgs) {
-            const subj = (m.subject() || "").toLowerCase();
-            const senderName = m.sender() ? (m.sender().name() || "").toLowerCase() : "";
-            const senderEmail = m.sender() ? (m.sender().address() || "").toLowerCase() : "";
-            if (subj.includes(q) || senderName.includes(q) || senderEmail.includes(q)) {
-                matches.push(messageToObj(m, false));
-                if (matches.length >= limit) return matches;
-            }
+            try {
+                const subj = safeGet(() => (m.subject() || "").toLowerCase(), "");
+                const s = safeGet(() => m.sender(), null);
+                const senderName = !s ? "" : typeof s === "string" ? s.toLowerCase() : (typeof s.name === "function" ? safeGet(() => s.name(), "").toLowerCase() : (s.name || "").toLowerCase());
+                const senderEmail = !s || typeof s === "string" ? "" : (typeof s.address === "function" ? safeGet(() => s.address(), "").toLowerCase() : (s.address || "").toLowerCase());
+                const recipientAddrs = safeGet(() => m.toRecipients().map(r => {
+                    const name = typeof r.name === "function" ? safeGet(() => r.name(), "") : (r.name || "");
+                    const addr = typeof r.address === "function" ? safeGet(() => r.address(), "") : (r.address || "");
+                    return (name + " " + addr).toLowerCase();
+                }).join(" "), "");
+                if (subj.includes(q) || senderName.includes(q) || senderEmail.includes(q) || recipientAddrs.includes(q)) {
+                    matches.push(messageToObj(m, false));
+                    if (matches.length >= limit) return matches;
+                }
+            } catch (_) { continue; }
         }
     }
     return matches;
