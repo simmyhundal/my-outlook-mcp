@@ -28,21 +28,23 @@ const BODY_CAP = 8000;
 // Helper: turn an Outlook message object into a plain JS object we can
 // stringify. We deliberately pull only the fields we need — never anything
 // like attachments-as-bytes that could cause us to ship gigabytes back.
+function safeGet(fn, fallback) {
+    try { return fn(); } catch (_) { return fallback; }
+}
+
 function messageToObj(msg, includeBody) {
+    const s = safeGet(() => msg.sender(), null);
     const obj = {
-        id: msg.id(),
-        subject: msg.subject(),
-        sender: msg.sender() ? msg.sender().name() : "(unknown)",
-        senderEmail: msg.sender() ? msg.sender().address() : "",
-        // .timeReceived() returns a JS Date; toISOString gives a stable format
-        received: msg.timeReceived() ? msg.timeReceived().toISOString() : null,
-        isRead: msg.isRead(),
-        hasAttachments: msg.hasAttachment(),
+        id: safeGet(() => msg.id(), null),
+        subject: safeGet(() => msg.subject(), ""),
+        sender: !s ? "(unknown)" : typeof s === "string" ? s : (typeof s.name === "function" ? safeGet(() => s.name(), "(unknown)") : (s.name || "(unknown)")),
+        senderEmail: !s || typeof s === "string" ? "" : (typeof s.address === "function" ? safeGet(() => s.address(), "") : (s.address || "")),
+        received: safeGet(() => { const t = msg.timeReceived(); return t ? t.toISOString() : null; }, null),
+        isRead: safeGet(() => msg.isRead(), null),
+        hasAttachments: safeGet(() => msg.hasAttachment(), false),
     };
     if (includeBody) {
-        // plainTextContent strips the HTML for us. If you ever want HTML,
-        // use msg.content() instead — but be careful, it's much bigger.
-        let body = msg.plainTextContent() || "";
+        let body = safeGet(() => msg.plainTextContent(), "") || "";
         if (body.length > BODY_CAP) {
             body = body.substring(0, BODY_CAP) + "\n\n[... truncated ...]";
         }
@@ -148,10 +150,12 @@ function search_emails(args) {
 // to list_emails / search_emails.
 function list_folders() {
     const Outlook = Application("Microsoft Outlook");
-    return Outlook.mailFolders().map(f => ({
-        name: f.name(),
-        unreadCount: f.unreadCount(),
-    }));
+    return Outlook.mailFolders()
+        .filter(f => f.name())
+        .map(f => ({
+            name: f.name(),
+            unreadCount: f.unreadCount(),
+        }));
 }
 
 // === Dispatcher ===
