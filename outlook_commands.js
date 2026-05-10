@@ -2,34 +2,48 @@
 //
 // outlook_commands.js
 // ====================
-// This is a JXA (JavaScript for Automation) script that talks to the Outlook
-// app on your Mac. It's the same mechanism AppleScript uses — macOS lets
-// scripts control native apps, and Outlook for Mac (classic) exposes a
-// scripting interface we can drive.
+// JXA (JavaScript for Automation) script that talks to Outlook for Mac.
+// Called by outlook_bridge.py via `osascript -l JavaScript`.
+// Receives a command name + JSON args, prints JSON result to stdout.
 //
-// The Python server (server.py) calls this script via `osascript`, passing
-// a command name and a JSON blob of arguments. We dispatch to the right
-// function and print JSON back to stdout. The Python side parses the JSON.
-//
-// Why JXA and not pure Python? Python can't talk to Outlook's scripting
-// dictionary directly. JXA is the bridge. (You could also use AppleScript,
-// but JXA gives us real JSON.stringify which is much cleaner.)
-//
-// IMPORTANT: this script is read-only. There is no `send`, `delete`,
-// `move`, or `mark as read` function. If something goes wrong, the worst
-// it can do is read mail you can already see in Outlook.
+// IMPORTANT: read-only. No send, delete, move, or mark-as-read.
 //
 
-// Cap on how much email body text we return per message. Long emails can
-// blow out Claude's context window. Bump this if you need more, but be
-// aware it costs tokens.
 const BODY_CAP = 8000;
 
-// Helper: turn an Outlook message object into a plain JS object we can
-// stringify. We deliberately pull only the fields we need — never anything
-// like attachments-as-bytes that could cause us to ship gigabytes back.
 function safeGet(fn, fallback) {
     try { return fn(); } catch (_) { return fallback; }
+}
+
+// Recursively collect every mail folder across all accounts/sub-folders.
+// Outlook.mailFolders() only returns top-level folders for the default account.
+// For multi-account setups the second account's folders live as sub-folders
+// under containers like "Sur mon ordinateur".
+function getAllFolders() {
+    const Outlook = Application("Microsoft Outlook");
+    const result = [];
+    function collect(folders) {
+        for (const f of folders) {
+            try {
+                result.push(f);
+                const subs = safeGet(() => f.mailFolders(), []);
+                if (subs.length > 0) collect(subs);
+            } catch (_) {}
+        }
+    }
+    collect(safeGet(() => Outlook.mailFolders(), []));
+    return result;
+}
+
+// Resolve a recipient object to {name, address}, handling both callable
+// methods and plain string properties (JXA quirk with some Outlook versions).
+function recipientToObj(r) {
+    if (!r) return { name: "", address: "" };
+    if (typeof r === "string") return { name: r, address: "" };
+    return {
+        name: typeof r.name === "function" ? safeGet(() => r.name(), "") : (r.name || ""),
+        address: typeof r.address === "function" ? safeGet(() => r.address(), "") : (r.address || ""),
+    };
 }
 
 function messageToObj(msg, includeBody) {
@@ -53,55 +67,50 @@ function messageToObj(msg, includeBody) {
     return obj;
 }
 
-// === Tool implementations ===
-// Each function here is callable from server.py. They all return plain
-// JS objects/arrays that get JSON.stringified at the end.
-
-// List recent emails from a folder. Default: inbox, 10 most recent.
 function list_emails(args) {
     const Outlook = Application("Microsoft Outlook");
     const folderName = args.folder || "Inbox";
     const limit = args.limit || 10;
     const unreadOnly = args.unread_only || false;
 
-    // Outlook's scripting API exposes folders by name. "Inbox" is the
-    // default mail folder; you can also pass "Sent Items", "Drafts", etc.
-    let folder;
+    let messages = [];
     if (folderName.toLowerCase() === "inbox") {
-        folder = Outlook.inbox;
+        messages = safeGet(() => Outlook.inbox.messages(), []);
     } else {
-        // Look up by exact name across all mail folders.
-        const allFolders = Outlook.mailFolders();
-        folder = allFolders.find(f => f.name() === folderName);
-        if (!folder) {
-            throw new Error(`Folder not found: ${folderName}`);
+        // Collect from ALL folders matching the name (covers multiple accounts).
+        const matched = getAllFolders().filter(f => safeGet(() => f.name(), "") === folderName);
+        if (matched.length === 0) throw new Error(`Folder not found: ${folderName}`);
+        for (const f of matched) {
+            messages = messages.concat(safeGet(() => f.messages(), []));
         }
+        // Sort newest-first across merged folders.
+        messages.sort((a, b) => {
+            const ta = safeGet(() => a.timeReceived(), null);
+            const tb = safeGet(() => b.timeReceived(), null);
+            if (!ta && !tb) return 0;
+            if (!ta) return 1;
+            if (!tb) return -1;
+            return tb - ta;
+        });
     }
 
-    // Pull messages. Outlook returns them newest-first in the inbox.
-    let messages = folder.messages();
-    if (unreadOnly) {
-        messages = messages.filter(m => !m.isRead());
+    if (unreadOnly) messages = messages.filter(m => safeGet(() => !m.isRead(), false));
+    // Deduplicate by id (multiple accounts can expose the same message).
+    const seen = new Set();
+    const unique = [];
+    for (const m of messages) {
+        const id = safeGet(() => m.id(), null);
+        if (id !== null && !seen.has(id)) { seen.add(id); unique.push(m); }
     }
-    messages = messages.slice(0, limit);
-
-    return messages.map(m => messageToObj(m, false));
+    return unique.slice(0, limit).map(m => messageToObj(m, false));
 }
 
-// Get the full body of one email by ID.
 function get_email(args) {
-    const Outlook = Application("Microsoft Outlook");
     if (!args.id) throw new Error("Missing required argument: id");
-
-    // We have to search for the message by ID. Outlook's JXA bindings
-    // don't have a direct getById, so we iterate. This is fine for normal
-    // use — you'll have looked it up via list_emails first, so it's still
-    // in cache.
-    const folders = Outlook.mailFolders();
-    for (const folder of folders) {
-        const msgs = folder.messages();
+    for (const folder of getAllFolders()) {
+        const msgs = safeGet(() => folder.messages(), []);
         for (const msg of msgs) {
-            if (msg.id() == args.id) {
+            if (safeGet(() => msg.id(), null) == args.id) {
                 return messageToObj(msg, true);
             }
         }
@@ -109,7 +118,6 @@ function get_email(args) {
     throw new Error(`Email not found: ${args.id}`);
 }
 
-// Search emails by subject/sender substring.
 function search_emails(args) {
     const Outlook = Application("Microsoft Outlook");
     if (!args.query) throw new Error("Missing required argument: query");
@@ -119,32 +127,29 @@ function search_emails(args) {
 
     let foldersToSearch;
     if (folderName.toLowerCase() === "all") {
-        // "all" iterates every folder. Slow on big mailboxes — only use
-        // when you can't predict where the message is.
-        foldersToSearch = Outlook.mailFolders();
+        foldersToSearch = getAllFolders();
     } else if (folderName.toLowerCase() === "inbox") {
         foldersToSearch = [Outlook.inbox];
     } else {
-        const folder = Outlook.mailFolders().find(f => f.name() === folderName);
-        if (!folder) throw new Error(`Folder not found: ${folderName}`);
-        foldersToSearch = [folder];
+        // Match all folders with this name (multiple accounts).
+        foldersToSearch = getAllFolders().filter(f => safeGet(() => f.name(), "") === folderName);
+        if (foldersToSearch.length === 0) throw new Error(`Folder not found: ${folderName}`);
     }
 
     const matches = [];
+    const seen = new Set();
     for (const folder of foldersToSearch) {
         const msgs = safeGet(() => folder.messages(), []);
         for (const m of msgs) {
             try {
+                const id = safeGet(() => m.id(), null);
+                if (id !== null && seen.has(id)) continue;
                 const subj = safeGet(() => (m.subject() || "").toLowerCase(), "");
                 const s = safeGet(() => m.sender(), null);
                 const senderName = !s ? "" : typeof s === "string" ? s.toLowerCase() : (typeof s.name === "function" ? safeGet(() => s.name(), "").toLowerCase() : (s.name || "").toLowerCase());
                 const senderEmail = !s || typeof s === "string" ? "" : (typeof s.address === "function" ? safeGet(() => s.address(), "").toLowerCase() : (s.address || "").toLowerCase());
-                const recipientAddrs = safeGet(() => m.toRecipients().map(r => {
-                    const name = typeof r.name === "function" ? safeGet(() => r.name(), "") : (r.name || "");
-                    const addr = typeof r.address === "function" ? safeGet(() => r.address(), "") : (r.address || "");
-                    return (name + " " + addr).toLowerCase();
-                }).join(" "), "");
-                if (subj.includes(q) || senderName.includes(q) || senderEmail.includes(q) || recipientAddrs.includes(q)) {
+                if (subj.includes(q) || senderName.includes(q) || senderEmail.includes(q)) {
+                    if (id !== null) seen.add(id);
                     matches.push(messageToObj(m, false));
                     if (matches.length >= limit) return matches;
                 }
@@ -154,40 +159,43 @@ function search_emails(args) {
     return matches;
 }
 
-// List the names of all mail folders. Useful so you know what to pass
-// to list_emails / search_emails.
 function list_folders() {
     const Outlook = Application("Microsoft Outlook");
-    return Outlook.mailFolders()
-        .filter(f => f.name())
-        .map(f => ({
-            name: f.name(),
-            unreadCount: f.unreadCount(),
-        }));
+    // Try to identify special folders by comparing object identity to
+    // well-known Outlook properties (inbox, outbox, drafts, sent).
+    // We compare name+unreadCount as a proxy since JXA object equality is unreliable.
+    const specialCandidates = {};
+    ["inbox", "outbox", "drafts"].forEach(prop => {
+        try {
+            const f = Outlook[prop];
+            const key = safeGet(() => f.name() + "|" + f.unreadCount(), null);
+            if (key) specialCandidates[key] = prop;
+        } catch (_) {}
+    });
+
+    return getAllFolders()
+        .map(f => {
+            const name = safeGet(() => f.name(), null);
+            const unreadCount = safeGet(() => f.unreadCount(), 0);
+            const key = name + "|" + unreadCount;
+            const obj = { name, unreadCount };
+            if (specialCandidates[key]) obj.specialType = specialCandidates[key];
+            // Heuristic: identify sent folders by French/English name patterns.
+            if (name && /envoy|sent item/i.test(name)) obj.specialType = "sent";
+            if (name && /brouillon|draft/i.test(name)) obj.specialType = obj.specialType || "drafts";
+            if (name && /bo[iî]te de r[eé]ception|inbox/i.test(name)) obj.specialType = obj.specialType || "inbox";
+            return obj;
+        })
+        .filter(f => f.name);
 }
 
-// === Dispatcher ===
-// osascript passes argv to the run() function. We expect:
-//   argv[0] = command name
-//   argv[1] = JSON string of arguments (optional)
-//
 function run(argv) {
     try {
         const command = argv[0];
         const args = argv[1] ? JSON.parse(argv[1]) : {};
-
-        const commands = {
-            list_emails,
-            get_email,
-            search_emails,
-            list_folders,
-        };
-
+        const commands = { list_emails, get_email, search_emails, list_folders };
         const fn = commands[command];
-        if (!fn) {
-            return JSON.stringify({ error: `Unknown command: ${command}` });
-        }
-
+        if (!fn) return JSON.stringify({ error: `Unknown command: ${command}` });
         const result = fn(args);
         return JSON.stringify({ ok: true, data: result });
     } catch (e) {

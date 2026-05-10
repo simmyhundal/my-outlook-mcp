@@ -61,25 +61,30 @@ def read_email(email_id: str) -> dict:
 
 @mcp.tool()
 def search_emails(query: str, folder: str = "Inbox", limit: int = 20) -> list:
-    """Search for emails by subject, sender, or recipient (case-insensitive substring match).
+    """Search for emails by subject or sender (case-insensitive substring match).
 
     Args:
-        query: Substring to look for in subject, sender name, sender email, recipient name, or recipient email.
+        query: Substring to look for in subject, sender name, or sender email.
         folder: Folder to search in. Use "all" to search every folder (slow on large mailboxes).
-              Use the exact French folder name (e.g. "Éléments envoyés") for Sent Items.
+              Use the exact folder name from list_folders() for non-inbox folders
+              (e.g. "Éléments envoyés" for Sent Items on a French Outlook).
         limit: Max matches to return.
 
-    Returns a list of matching email summaries.
+    Returns a list of matching email summaries. To find emails sent TO a specific
+    person or domain, search the sent folder by their name or domain in the subject,
+    or use read_email on a result to see full To/CC headers in the quoted thread.
     """
     return outlook_bridge.search_emails(query=query, folder=folder, limit=limit)
 
 
 @mcp.tool()
 def list_folders() -> list:
-    """List all mail folders with their unread counts.
+    """List all mail folders with their unread counts and special type hints.
 
-    Useful before calling list_recent_emails on a non-Inbox folder, to find
-    the exact folder name.
+    Always call this first before searching non-inbox folders. The returned
+    specialType field identifies inbox, sent, drafts folders by function —
+    use the corresponding name as the folder argument to list_recent_emails
+    or search_emails. To find emails the user sent, look for specialType='sent'.
     """
     return outlook_bridge.list_folders()
 
