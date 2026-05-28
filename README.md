@@ -1,58 +1,72 @@
 # my-outlook-mcp
 
-A read-only MCP server that gives Claude Desktop access to your local
-Outlook for Mac (classic) inbox. Built from scratch so you can read every
-line of code that touches your email.
+A local MCP server that gives Claude Desktop read access to Outlook for Mac — no OAuth, no Microsoft Graph, no cloud credentials. Built from scratch so every line of code that touches personal email is readable in under ten minutes.
 
-## What it does
+## Impact
 
-Exposes four tools to Claude:
+- **~10 emails/week** routed through Claude for CRM triage and follow-up tracking, keeping relationship context current without manual inbox archaeology
+- Runs entirely on-device; zero data leaves the machine beyond what Claude Desktop already handles
+- Handles a French-locale Outlook installation (real edge case, not hypothetical — see [AI Design Notes](#ai-design-notes))
 
-- `list_recent_emails(folder, limit, unread_only)` — list emails from a folder
-- `read_email(email_id)` — fetch the full body of one email
-- `search_emails(query, folder, limit)` — substring search by subject or sender
-- `list_folders()` — list all mail folders with unread counts
+## Project Overview
 
-## What it does NOT do
+This server does two distinct jobs.
 
-- Send email
-- Delete email
-- Move, mark-as-read, or modify anything
-- Touch the network (no Microsoft Graph, no OAuth, no telemetry)
-- Store credentials of any kind
+**Job 1 — Give Claude a local email interface.** Four read-only tools let Claude list folders, enumerate recent messages, fetch a full body, and run substring search. Claude picks the right call sequence autonomously; the human just asks in plain English.
 
-If a malicious email tries to prompt-inject Claude into "deleting all my
-mail," there is literally no tool here that can do that. The blast radius
-is bounded by the code in this folder.
+**Job 2 — Enforce a hard write boundary by default.** The Outlook scripting API supports send, delete, and move — this server deliberately exposes none of them. The blast radius of a prompt-injection attack from a malicious incoming email is bounded to what can be *read*, not what can be *done*.
 
 ## Architecture
 
 ```
 Claude Desktop
-     │ stdio (MCP protocol — JSON-RPC)
+     │  stdio · MCP JSON-RPC
      ▼
-  server.py          ← FastMCP, registers the 4 tools
+server.py              FastMCP · registers 4 @mcp.tool() functions
      │
      ▼
-outlook_bridge.py    ← runs `osascript` as a subprocess
+outlook_bridge.py      subprocess wrapper · calls osascript · parses JSON
      │
      ▼
-outlook_commands.js  ← JXA script, talks to Outlook's scripting API
+outlook_commands.js    JXA · talks to Outlook's scripting API
      │
      ▼
-  Outlook for Mac (classic)
+Outlook for Mac (classic)
 ```
 
-Each layer is small enough to read in 5 minutes. That's the whole point.
+| Layer | Language | Responsibility |
+|---|---|---|
+| `server.py` | Python | MCP protocol, tool registration, schema generation |
+| `outlook_bridge.py` | Python | Subprocess management, error normalisation |
+| `outlook_commands.js` | JXA (JavaScript for Automation) | Outlook scripting API, JSON serialisation |
+
+**Why JXA?** Python has no direct path to Outlook's scripting dictionary. The bridge spawns `osascript -l JavaScript` per call — roughly 100 ms of overhead per tool invocation, acceptable for interactive use. The entire payload is a plain JSON string printed to stdout; no IPC framework, nothing to version.
+
+## AI Design Notes
+
+This server contains no LLM calls. The "AI layer" is Claude Desktop itself; this codebase is the tool surface Claude reasons over.
+
+**Tool docstrings as prompts.** Each `@mcp.tool()` docstring is the only instruction Claude receives about when and how to call that function. They're written to prevent common failure modes: `list_folders()` tells Claude to look for `specialType='sent'` before touching sent mail; `search_emails` warns that `folder="all"` iterates every folder and is slow on large mailboxes. This is prompt engineering at the interface layer — not in a system prompt, but in the schema Claude reads before each tool call.
+
+**Locale reliability.** Running on a French-locale macOS against a French-locale Outlook means folder names like `Éléments envoyés` instead of `Sent Items`. The JXA layer normalises folder discovery so Claude never needs to know the locale — it always receives English `specialType` tags regardless of what Outlook reports. This was a real production bug that broke multi-account folder discovery; fixing it required matching against both locale variants in the scripting layer.
+
+**Read-only as a principle, not a gap.** Least-privilege by default: the scripting API supports write operations; the server does not expose them. This mirrors a standard posture for agentic systems — minimise the tool surface until there is a specific, deliberate reason to expand it. Adding write tools is a future option, not an oversight, and it warrants explicit reasoning about the expanded blast radius.
+
+**Cost.** Zero incremental API cost beyond Claude Desktop's subscription. No embeddings, no background jobs, no telemetry.
+
+## Key Invariants
+
+- Outlook must be open and signed in; the server does not launch it
+- Email IDs are positional, not stable GUIDs — do not persist them across sessions
+- Bodies are capped at 8 000 characters per `read_email` call to limit context consumption
+- `search_emails(folder="all")` scans every folder linearly — prefer a specific folder name when the target is known
 
 ## Requirements
 
 - macOS
-- **Classic** Outlook for Mac (not "New Outlook" — the new one has no
-  scripting interface). Check via Outlook → About Microsoft Outlook. If
-  it says "New Outlook," toggle it off in the Outlook menu.
+- **Classic** Outlook for Mac (not "New Outlook" — the new one has no scripting interface). Check via Outlook → About Microsoft Outlook; if it says "New Outlook," toggle it off in the Outlook menu.
 - Python 3.10+
-- Outlook must be open and signed in when the server runs.
+- Outlook open and signed in when the server runs
 
 ## Setup
 
@@ -63,31 +77,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Test before wiring up to Claude
-
-Make sure Outlook is open, then:
+Verify the connection before wiring up to Claude:
 
 ```bash
 python test_connection.py
 ```
 
-The first run, macOS will pop up a dialog: "Terminal wants to control
-Microsoft Outlook." Click **OK**. If you miss it, go to:
+On first run macOS will prompt: *"Terminal wants to control Microsoft Outlook."* Click **OK**, or grant it manually:
 
-  System Settings → Privacy & Security → Automation → Terminal → enable Outlook
+> System Settings → Privacy & Security → Automation → Terminal → Outlook ✓
 
-You should see your folders and last 5 emails print.
+You should see your folders and last 5 emails printed to stdout.
 
 ## Wire up to Claude Desktop
 
-Get the absolute paths:
-
 ```bash
+# Get the absolute paths you'll paste into config
 echo "$(pwd)/.venv/bin/python"
 echo "$(pwd)/server.py"
 ```
 
-Open Claude Desktop → Settings → Developer → Edit Config, and add:
+Open Claude Desktop → Settings → Developer → Edit Config:
 
 ```json
 {
@@ -100,31 +110,24 @@ Open Claude Desktop → Settings → Developer → Edit Config, and add:
 }
 ```
 
-Quit Claude Desktop completely (Cmd+Q) and reopen. You should see
-`my-outlook` in the connected tools list.
+Quit Claude Desktop completely (Cmd+Q) and reopen. `my-outlook` will appear in the connected tools list.
 
 ## Try it
 
-In a new Claude conversation:
+```
+What are my unread emails this week?
+Find emails from [name] about the term sheet.
+Summarize the last five messages from my advisor.
+```
 
-> What are my unread emails today?
->
-> Find emails from my advisor about the thesis proposal.
->
-> Summarize the most recent email in my inbox.
+## Extending
 
-## Adding tools later
+To add a new tool:
 
-If you want to extend this — for example, list calendar events — the
-pattern is:
-
-1. Add a function to `outlook_commands.js` that returns a JS object/array.
+1. Add a function to `outlook_commands.js` returning a plain JS object or array.
 2. Register it in the `commands` map at the bottom of that file.
-3. Add a wrapper to `outlook_bridge.py` that calls `_run_jxa(...)`.
-4. Add a `@mcp.tool()`-decorated function to `server.py`.
+3. Add a `_run_jxa(...)` wrapper in `outlook_bridge.py`.
+4. Decorate a new Python function with `@mcp.tool()` in `server.py`.
 5. Restart Claude Desktop.
 
-If you want to add **write** capabilities (send, draft, move), do it
-deliberately. The reason this server is safe is precisely that those
-tools don't exist. Adding them shifts the threat model — at minimum,
-think about prompt injection from incoming email.
+**Before adding write tools** (send, draft, move): the read-only constraint is load-bearing for the threat model. Adding write capability is a deliberate choice — at minimum, document the expanded blast radius and consider scoping each tool narrowly (e.g., draft-only, not send).
